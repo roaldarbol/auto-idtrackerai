@@ -121,6 +121,8 @@ def "main init" [] {
 # Updates the CSV after each job so progress is preserved if the run is aborted
 # Use --dry-run to test the script logic without invoking idtrackerai;
 # the CSV is restored to its original state at the end of a dry run
+# If a knowledge_transfer column is present and non-empty for a row, the
+# --knowledge_transfer_folder flag is passed to idtrackerai for that job
 # ---------------------------------------------------------------------------
 def "main track" [--dry-run] {
     main fix-paths
@@ -145,90 +147,102 @@ def "main track" [--dry-run] {
     let count = ($pending | length)
     print $"Running ($count) pending jobs..."
 
-    # Track which session folders have been claimed this run to avoid
-    # assigning the same folder to multiple settings files for the same video
-    mut claimed_folders = []
-
     for row in $pending {
         print $"\nTracking: ($row.settings_file)"
 
+        # Snapshot existing session folders before the job runs so we can
+        # identify the new one by diffing afterwards. This is robust to
+        # multiple settings files sharing the same video name, unlike any
+        # approach that tries to match folder names after the fact.
+        let folders_before = (
+            try { ls $SESSIONS_DIR | get name } catch { [] }
+        )
+
+        # Use try/catch so Nushell does not treat a non-zero exit code from
+        # idtrackerai as a fatal error, while still streaming output to the
+        # terminal normally. $env.LAST_EXIT_CODE is set after the command.
         if $dry_run {
             print "(dry run - skipping idtrackerai)"
         } else {
-            ^idtrackerai --load $row.settings_file --track --output_dir $SESSIONS_DIR
+            let has_kt = ("knowledge_transfer" in ($row | columns)) and ($row.knowledge_transfer | is-not-empty)
+            if $has_kt {
+                print $"Using knowledge transfer from: ($row.knowledge_transfer)"
+                try { ^idtrackerai --load $row.settings_file --track --output_dir $SESSIONS_DIR --knowledge_transfer_folder $row.knowledge_transfer } catch {}
+            } else {
+                try { ^idtrackerai --load $row.settings_file --track --output_dir $SESSIONS_DIR } catch {}
+            }
         }
-        let exit_code = if $dry_run { 0 } else { $env.LAST_EXIT_CODE }
         let ts = (date now | format date "%Y-%m-%dT%H:%M:%S")
 
-        # Find the session folder created by this run, excluding already claimed ones
-        # In dry run mode, simulate the _1, _2 etc. suffixes idtrackerai would produce
-        let session_folder = try {
-            if ($row.video | is-empty) {
-                ""
-            } else {
-                let matches = (
-                    ls $SESSIONS_DIR
-                    | where name =~ $"session_($row.video)"
-                    | where { |f| not ($f.name in $claimed_folders) }
-                    | sort-by modified --reverse
-                )
-                if ($matches | is-not-empty) {
-                    $matches | first | get name
-                } else if $dry_run {
-                    let base = ($SESSIONS_DIR | path join $"session_($row.video)")
-                    let all_claimed = ($claimed_folders | where { |f| $f =~ $"session_($row.video)" })
-                    if ($all_claimed | is-empty) {
-                        $base
-                    } else {
-                        $"($base)_($all_claimed | length)"
-                    }
-                } else {
-                    ""
-                }
-            }
-        } catch {
-            print "Warning: error detecting session folder, check sessions directory manually."
-            ""
+        # The new session folder is whichever entry now exists that wasn't
+        # there before. This is robust to multiple settings files sharing
+        # the same video name and to idtrackerai's _1, _2 suffix scheme.
+        let folders_after = (try { ls $SESSIONS_DIR | get name } catch { [] })
+        let session_folder = if $dry_run {
+            let base = ($SESSIONS_DIR | path join $"session_($row.video)")
+            let n = ($folders_before | where { |f| $f =~ $"session_($row.video)" } | length)
+            if $n == 0 { $base } else { $"($base)_($n)" }
+        } else {
+            let new_folders = ($folders_after | where { |f| not ($f in $folders_before) })
+            if ($new_folders | is-not-empty) { $new_folders | first } else { "" }
         }
 
-        if ($session_folder | is-not-empty) {
-            $claimed_folders = ($claimed_folders | append $session_folder)
-        }
-
-        let new_status = if $exit_code != 0 {
-            "failed"
+        # idtrackerai exits with code 1 even on success, so we determine
+        # status from the log content instead: a missing session folder or
+        # a CRITICAL line means failure; absence of "Success" also means failure.
+        let session_log = ($session_folder | path join "idtrackerai.log")
+        let new_status = if $dry_run {
+            "done"
         } else if ($session_folder | is-empty) {
+            "failed"
+        } else if not ($session_log | path exists) {
             "failed"
         } else {
-            "done"
+            let log_content = (try { open $session_log --raw } catch { "" })
+            if ($log_content | str contains "CRITICAL") {
+                "failed"
+            } else if not ($log_content | str contains "Success") {
+                "failed"
+            } else {
+                "done"
+            }
         }
 
-        if $exit_code != 0 {
-            print $"FAILED: ($row.settings_file)"
-        } else if ($session_folder | is-empty) {
-            print $"FAILED: ($row.settings_file) - no session folder detected, tracking may not have run."
+        if ($session_folder | is-empty) {
+            print $"FAILED: ($row.settings_file) - no session folder detected"
+        } else if $new_status == "failed" {
+            let session_name = ($session_folder | path basename)
+            print $"FAILED: ($row.settings_file) - check logs/($session_name).log"
         } else {
             print $"Done: ($row.settings_file)"
         }
 
-        # Copy the idtrackerai log before it gets overwritten by the next job
-        if (not $dry_run) and ("idtrackerai.log" | path exists) and ($session_folder | is-not-empty) {
+        # Copy the idtrackerai log before it gets overwritten by the next job.
+        if (not $dry_run) and ($session_folder | is-not-empty) and ($session_log | path exists) {
             let session_name = ($session_folder | path basename)
-            cp "idtrackerai.log" ($LOGS_DIR | path join $"($session_name).log")
+            try {
+                cp $session_log ($LOGS_DIR | path join $"($session_name).log")
+            } catch { |e|
+                print $"Warning: could not copy log for ($session_name): ($e.msg)"
+            }
         }
 
-        # Write after every job so progress is not lost if the run is interrupted
-        let updated = (
-            open $TRACKING_CSV
-            | each { |r|
-                if $r.settings_file == $row.settings_file {
-                    $r | update status $new_status | update timestamp $ts | update session_folder $session_folder
-                } else {
-                    $r
+        # Write after every job so progress is not lost if the run is interrupted.
+        try {
+            let updated = (
+                open $TRACKING_CSV
+                | each { |r|
+                    if $r.settings_file == $row.settings_file {
+                        $r | update status $new_status | update timestamp $ts | update session_folder $session_folder
+                    } else {
+                        $r
+                    }
                 }
-            }
-        )
-        $updated | save --force $TRACKING_CSV
+            )
+            $updated | save --force $TRACKING_CSV
+        } catch { |e|
+            print $"Warning: could not update ($TRACKING_CSV) for ($row.settings_file): ($e.msg)"
+        }
     }
 
     if $dry_run {
